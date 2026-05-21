@@ -2397,7 +2397,14 @@ function renderParametres() {
       <div class="form-group"><label>Téléphone</label><input id="p-tel" value="${hotel.tel||''}" /></div>
       <div class="form-group"><label>Email</label><input id="p-email" value="${hotel.email||''}" /></div>
       <div class="form-group"><label>Site web</label><input id="p-web" value="${hotel.site||'manevasion.hotel'}" /></div>
-      <div class="form-group"><label>Logo (URL ou base64)</label><input id="p-logo" value="${hotel.logo||''}" placeholder="https://..." /></div>
+      <div class="form-group" style="grid-column: 1 / -1;">
+        <label>Logo de l'Hôtel</label>
+        <div style="display:flex;align-items:center;gap:12px;">
+          <img id="p-logo-preview" src="${hotel.logo||''}" style="width:60px;height:60px;object-fit:contain;border:1px solid var(--border);display:${hotel.logo?'block':'none'};" />
+          <input type="file" id="p-logo-file" accept="image/*" onchange="previewUserPhoto('p-logo-file','p-logo-preview','p-logo-data')" style="flex:1;" />
+          <input type="hidden" id="p-logo-data" value="${hotel.logo||''}" />
+        </div>
+      </div>
     </div>
     <div class="btn-row"><button class="btn btn-primary" onclick="saveHotelParams()">💾 Enregistrer</button></div>
   </div>
@@ -2458,9 +2465,11 @@ window.saveHotelParams = function() {
   DB.set('hotel', {
     nom: document.getElementById('p-nom').value, adresse: document.getElementById('p-adr').value,
     tel: document.getElementById('p-tel').value, email: document.getElementById('p-email').value,
-    site: document.getElementById('p-web').value, logo: document.getElementById('p-logo').value
+    site: document.getElementById('p-web').value, 
+    logo: document.getElementById('p-logo-data').value
   });
   alert('✅ Informations hôtel enregistrées.');
+  navigateTo('parametres');
 };
 
 window.addUserModal = function() {
