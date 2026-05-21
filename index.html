@@ -408,21 +408,17 @@ tr:hover td { background: #f8f6f0; }
       window.firebaseHotelId = hotelId;
       console.log('✅ Firebase connecté — hôtel:', hotelId);
 
-      // Activer la synchronisation temps réel pour les données clés
-      window.FBDB.listen('chambres', data => {
-        if (typeof currentPage !== 'undefined' && (currentPage === 'chambres' || currentPage === 'dashboard')) {
-          navigateTo(currentPage);
-        }
-      });
-      window.FBDB.listen('reservations', data => {
-        if (typeof currentPage !== 'undefined' && currentPage === 'reservations') {
-          navigateTo(currentPage);
-        }
-      });
-      window.FBDB.listen('caisse', data => {
-        if (typeof currentPage !== 'undefined' && currentPage === 'caisse') {
-          navigateTo(currentPage);
-        }
+      // Activer la synchronisation temps réel pour TOUTES les données clés
+      const keysToSync = ['chambres', 'reservations', 'caisse', 'depenses', 'economat', 'personnel', 'pointages', 'clotures'];
+      const pageMap = { chambres: ['chambres','dashboard'], reservations: ['reservations','dashboard'], caisse: ['caisse','dashboard'], depenses: ['depenses'], economat: ['economat'], personnel: ['personnel'], pointages: ['personnel'], clotures: ['point_journalier'] };
+      keysToSync.forEach(k => {
+        window.FBDB.listen(k, data => {
+          try { localStorage.setItem('meh_'+k, JSON.stringify(data)); } catch(e) {}
+          const pages = pageMap[k] || [k];
+          if (typeof currentPage !== 'undefined' && pages.includes(currentPage)) {
+            navigateTo(currentPage);
+          }
+        });
       });
 
       // Bannière de statut
@@ -3105,7 +3101,9 @@ window.autoInitFirebase = async function() {
 const _origDBset = DB.set.bind(DB);
 DB.set = function(k, v) {
   _origDBset(k, v);
-  if (window.firebaseEnabled) {
+  // Toujours écrire dans Firebase si activé
+  if (window.firebaseEnabled && window.FBDB) {
+    window.FBDB.set(k, v);
     const ind = document.getElementById('sync-indicator');
     if (ind) {
       ind.classList.add('show');
