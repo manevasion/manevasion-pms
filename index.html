@@ -344,14 +344,19 @@ tr:hover td { background: #f8f6f0; }
   // Remplace le localStorage par Firebase Realtime Database
   // Fallback sur localStorage si Firebase non configuré
   window.FBDB = {
-    _ref(k) { return ref(firebaseDB, `hotels/${hotelId}/${k}`); },
+    _ref(k) {
+      const fbRef = window._firebaseRef || ref;
+      const db = window.firebaseDB || firebaseDB;
+      return fbRef(db, `hotels/${hotelId}/${k}`);
+    },
 
     async get(k) {
       if (!firebaseEnabled || !hotelId) {
         try { return JSON.parse(localStorage.getItem('meh_'+k)) || null; } catch(e) { return null; }
       }
       try {
-        const snap = await get(this._ref(k));
+        const fbGet = window._firebaseGet || get;
+        const snap = await fbGet(this._ref(k));
         return snap.exists() ? snap.val() : null;
       } catch(e) {
         console.warn('Firebase get error, fallback localStorage', e);
@@ -360,11 +365,10 @@ tr:hover td { background: #f8f6f0; }
     },
 
     set(k, v) {
-      // Toujours sauvegarder localement d'abord (pour la rapidité UI)
       try { localStorage.setItem('meh_'+k, JSON.stringify(v)); } catch(e) {}
-      // Puis sync Firebase
       if (firebaseEnabled && hotelId) {
-        set(this._ref(k), v).catch(e => console.warn('Firebase set error:', e));
+        const fbSet = window._firebaseSet || set;
+        fbSet(this._ref(k), v).catch(e => console.warn('Firebase set error:', e));
       }
     },
 
@@ -377,13 +381,12 @@ tr:hover td { background: #f8f6f0; }
       }
     },
 
-    // Écouter les changements en temps réel
     listen(k, callback) {
       if (!firebaseEnabled || !hotelId) return;
-      onValue(this._ref(k), snap => {
+      const fbOnValue = window._firebaseOnValue || onValue;
+      fbOnValue(this._ref(k), snap => {
         const data = snap.exists() ? snap.val() : null;
         if (data) {
-          // Mettre à jour localStorage aussi
           try { localStorage.setItem('meh_'+k, JSON.stringify(data)); } catch(e) {}
           callback(data);
         }
