@@ -738,7 +738,7 @@ let currentPage = '';
 // ===================== AUTH =====================
 const ROLES_ACCESS = {
   receptionniste: ['dashboard', 'chambres', 'reservations', 'caisse', 'depenses', 'point_journalier', 'services', 'extraits'],
-  economat: ['economat'],
+  economat: ['economat', 'services'],
   directeur: ['dashboard', 'chambres', 'reservations', 'caisse', 'depenses', 'economat', 'personnel', 'conges', 'rapports', 'taxes', 'parametres', 'point_journalier', 'services', 'extraits'],
   constructeur: ['dashboard', 'chambres', 'reservations', 'caisse', 'depenses', 'economat', 'personnel', 'conges', 'rapports', 'taxes', 'parametres', 'constructeur', 'point_journalier', 'services', 'extraits']
 };
@@ -1259,6 +1259,7 @@ window.doCheckout = function() {
   const resas = DB.get('reservations') || [];
   const idx = resas.findIndex(r => r.id === rid);
   if (idx === -1) return;
+  const r = resas[idx];
   
   // Check for pending services on bill
   const allServices = DB.get('services') || [];
@@ -1269,10 +1270,33 @@ window.doCheckout = function() {
     if (!ok) return;
   }
   
+  // Calcul du total TTC et du solde net (déduire l'acompte déjà versé)
+  const consoTotal = (r.consos||[]).reduce((s,c)=>s+(c.montant||0),0) + pendingServices.reduce((s,sv)=>s+(sv.montant||0),0);
+  const totalTTC = (r.montant||0) + consoTotal;
+  const acompteDejaVerse = r.acompte || 0;
+  const soldeARégler = Math.max(0, totalTTC - acompteDejaVerse);
+  
   resas[idx].statut = 'CHECK-OUT';
   resas[idx].heureSortie = heureSortie;
   resas[idx].paiementFinal = paiement;
+  resas[idx].totalTTC = totalTTC;
+  resas[idx].soldeFinal = soldeARégler;
   DB.set('reservations', resas);
+  
+  // Enregistrer le SOLDE en caisse (montant restant après déduction acompte)
+  if (soldeARégler > 0) {
+    const caisse = DB.get('caisse') || [];
+    caisse.push({
+      id: genId(), date: today(), type: 'CHECK-OUT',
+      ref: r.nom + ' ' + r.prenom + ' — Ch.' + r.chambre,
+      montant: soldeARégler, montantTTC: soldeARégler,
+      paiement, caissier: currentUser?.nom||'—',
+      recu: 'REC-' + genId().substr(-6).toUpperCase(),
+      reservationId: rid,
+      note: acompteDejaVerse > 0 ? 'Solde après déduction acompte de ' + fmtN(acompteDejaVerse) + ' FCFA' : ''
+    });
+    DB.set('caisse', caisse);
+  }
   
   // Libérer chambre
   const chambres = DB.get('chambres') || [];
@@ -1366,7 +1390,7 @@ function renderReservations() {
     </div>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>Date</th><th>Client</th><th>Chambre</th><th>Arrivée</th><th>Départ</th><th>Nuits</th><th>Montant</th><th>Paiement</th><th>Statut</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Date</th><th>Client</th><th>Chambre</th><th>Arrivée</th><th>Départ</th><th>Nuits</th><th>Total</th><th>Acompte</th><th>Statut</th><th>Actions</th></tr></thead>
       <tbody id="resas-tbody">
         ${resas.length ? resas.slice().reverse().map(r => `<tr data-nom="${(r.nom+' '+r.prenom).toLowerCase()}" data-chambre="${(r.chambre||'').toLowerCase()}" data-statut="${r.statut||''}">
           <td>${r.date||'—'}</td>
@@ -1376,12 +1400,17 @@ function renderReservations() {
           <td>${r.checkout||'—'}</td>
           <td>${r.nuits}</td>
           <td>${fmt(r.montant)}</td>
-          <td>${r.paiement||'—'}</td>
+          <td style="color:${(r.acompte||0)>0?'#16a34a':'#888'}">${r.acompte ? fmtN(r.acompte)+' F' : '—'}</td>
           <td>${resaStatusBadge(r.statut)}</td>
-          <td>
+          <td style="white-space:nowrap;">
             <button class="btn btn-sm btn-outline" onclick="showResaDetail('${r.id}')">Voir</button>
+            ${r.statut === 'CONFIRMÉE' ? `<button class="btn btn-sm btn-success" onclick="doCheckinFromResa('${r.id}')" title="Faire le Check-in">🟢 CI</button>` : ''}
+            ${r.statut === 'CHECK-IN' ? `<button class="btn btn-sm btn-danger" onclick="showCheckoutFromResa('${r.id}')" title="Faire le Check-out">🔴 CO</button>` : ''}
+            ${r.statut !== 'CHECK-OUT' && r.statut !== 'CHECK-IN' ? `<button class="btn btn-sm btn-warning" onclick="editResa('${r.id}')" title="Modifier">✏️</button>` : ''}
+            ${r.statut === 'CHECK-IN' ? `<button class="btn btn-sm btn-warning" onclick="editResa('${r.id}')" title="Modifier">✏️</button>` : ''}
             <button class="btn btn-sm btn-outline" onclick="printFacture('${r.id}', true)">Proforma</button>
             <button class="btn btn-sm btn-accent" onclick="printFacture('${r.id}')">🖨️</button>
+            ${(currentUser?.role === 'constructeur' || currentUser?.role === 'directeur') ? `<button class="btn btn-sm btn-danger" onclick="supprimerResa('${r.id}')" title="Supprimer">🗑️</button>` : ''}
           </td>
         </tr>`).join('') : '<tr><td colspan="10" class="text-center" style="color:#888;padding:20px;">Aucune réservation</td></tr>'}
       </tbody>
@@ -1404,13 +1433,238 @@ window.filterResas = function() {
   });
 };
 
+// ============================================================
+// GESTION RESERVATIONS: Check-in/out depuis liste, modifier, supprimer
+// ============================================================
+
+window.supprimerResa = function(id) {
+  if (!confirm('Supprimer définitivement cette réservation ?')) return;
+  const resas = (DB.get('reservations')||[]).filter(r => r.id !== id);
+  // Libérer la chambre si elle était occupée par cette resa
+  const deletedResa = (DB.get('reservations')||[]).find(r => r.id === id);
+  if (deletedResa && deletedResa.statut === 'CHECK-IN') {
+    const chambres = DB.get('chambres') || [];
+    const ci = chambres.findIndex(c => c.id === deletedResa.chambreId);
+    if (ci !== -1) {
+      chambres[ci] = { ...chambres[ci], statut:'DISPONIBLE', client:'', checkin:'', checkout:'', nuits:0 };
+      DB.set('chambres', chambres);
+    }
+  }
+  DB.set('reservations', resas);
+  navigateTo('reservations');
+};
+
+window.editResa = function(id) {
+  const r = (DB.get('reservations')||[]).find(x => x.id === id);
+  if (!r) return;
+  const allChambres = DB.get('chambres') || [];
+  showModal(`
+  <div class="modal-header"><h2>✏️ Modifier Réservation</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+  <div class="form-grid">
+    <div class="form-group"><label>Nom</label><input id="er-nom" value="${r.nom||''}" /></div>
+    <div class="form-group"><label>Prénom</label><input id="er-prenom" value="${r.prenom||''}" /></div>
+    <div class="form-group"><label>Téléphone</label><input id="er-tel" value="${r.tel||''}" /></div>
+    <div class="form-group"><label>Chambre</label>
+      <select id="er-chambre">
+        ${allChambres.map(c => `<option value="${c.id}" ${c.id===r.chambreId?'selected':''}>${c.num} — ${c.type} — ${fmtN(c.tarif)} F/nuit</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-group"><label>Arrivée</label><input type="date" id="er-checkin" value="${r.checkin||''}" onchange="calcEditNights()" /></div>
+    <div class="form-group"><label>Départ</label><input type="date" id="er-checkout" value="${r.checkout||''}" onchange="calcEditNights()" /></div>
+    <div class="form-group"><label>Nuits</label><input id="er-nuits" readonly style="background:#f0f0f0;" value="${r.nuits||0}" /></div>
+    <div class="form-group"><label>Tarif/nuit (FCFA)</label><input id="er-tarif" type="number" value="${r.tarif||0}" oninput="calcEditNights()" /></div>
+    <div class="form-group"><label>Acompte (FCFA)</label><input id="er-acompte" type="number" value="${r.acompte||0}" /></div>
+    <div class="form-group"><label>Paiement</label><select id="er-paiement">${modePaiementOptions(r.paiement)}</select></div>
+    <div class="form-group"><label>Adultes</label><input id="er-adultes" type="number" value="${r.adultes||1}" /></div>
+    <div class="form-group"><label>Statut</label>
+      <select id="er-statut">
+        ${['CONFIRMÉE','CHECK-IN','CHECK-OUT','ANNULÉE'].map(s=>`<option ${s===r.statut?'selected':''}>${s}</option>`).join('')}
+      </select>
+    </div>
+    <div class="form-group" style="grid-column:1/-1;"><label>Remarques</label><input id="er-rem" value="${r.remarques||''}" /></div>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-primary" onclick="saveEditResa('${id}')">💾 Enregistrer</button>
+    <button class="btn btn-outline" onclick="closeModal()">Annuler</button>
+  </div>`);
+  setTimeout(calcEditNights, 100);
+};
+
+window.calcEditNights = function() {
+  const ci = document.getElementById('er-checkin')?.value;
+  const co = document.getElementById('er-checkout')?.value;
+  const tarif = parseFloat(document.getElementById('er-tarif')?.value)||0;
+  const n = calcNights(ci, co);
+  if (document.getElementById('er-nuits')) document.getElementById('er-nuits').value = n;
+};
+
+window.saveEditResa = function(id) {
+  const resas = DB.get('reservations') || [];
+  const idx = resas.findIndex(r => r.id === id);
+  if (idx === -1) return;
+  const old = resas[idx];
+  const chamId = document.getElementById('er-chambre').value;
+  const ch = (DB.get('chambres')||[]).find(c => c.id === chamId);
+  if (!ch) return;
+  const checkin = document.getElementById('er-checkin').value;
+  const checkout = document.getElementById('er-checkout').value;
+  const tarif = parseFloat(document.getElementById('er-tarif').value)||old.tarif;
+  const nuits = calcNights(checkin, checkout);
+  const nouveauStatut = document.getElementById('er-statut').value;
+  
+  // Vérification double réservation (exclure la resa en cours de modif)
+  const conflict = resas.find(r => 
+    r.id !== id && r.chambreId === chamId && 
+    r.statut !== 'ANNULÉE' && r.statut !== 'CHECK-OUT' &&
+    !(checkout <= r.checkin || checkin >= r.checkout)
+  );
+  if (conflict) {
+    alert('⚠️ CONFLIT : La chambre ' + ch.num + ' est déjà réservée du ' + conflict.checkin + ' au ' + conflict.checkout + '.');
+    return;
+  }
+
+  resas[idx] = { ...old,
+    nom: document.getElementById('er-nom').value.trim(),
+    prenom: document.getElementById('er-prenom').value.trim(),
+    tel: document.getElementById('er-tel').value,
+    chambre: ch.num, chambreId: chamId, type: ch.type,
+    checkin, checkout, nuits, tarif,
+    montant: nuits * tarif,
+    acompte: parseFloat(document.getElementById('er-acompte').value)||0,
+    paiement: document.getElementById('er-paiement').value,
+    adultes: document.getElementById('er-adultes').value,
+    remarques: document.getElementById('er-rem').value,
+    statut: nouveauStatut
+  };
+  
+  // Sync chambre statut
+  const chambres = DB.get('chambres') || [];
+  const ci2 = chambres.findIndex(c => c.id === chamId);
+  if (nouveauStatut === 'CHECK-IN' && ci2 !== -1) {
+    chambres[ci2] = { ...chambres[ci2], statut:'OCCUPÉE', client: resas[idx].nom+' '+resas[idx].prenom, checkin, checkout, nuits };
+  } else if ((nouveauStatut === 'CHECK-OUT' || nouveauStatut === 'ANNULÉE') && ci2 !== -1) {
+    chambres[ci2] = { ...chambres[ci2], statut:'DISPONIBLE', client:'', checkin:'', checkout:'', nuits:0 };
+  }
+  DB.set('chambres', chambres);
+  DB.set('reservations', resas);
+  closeModal();
+  navigateTo('reservations');
+};
+
+window.doCheckinFromResa = function(id) {
+  const resas = DB.get('reservations') || [];
+  const idx = resas.findIndex(r => r.id === id);
+  if (idx === -1) return;
+  const r = resas[idx];
+  // Vérifier si la chambre est disponible
+  const chambres = DB.get('chambres') || [];
+  const ci = chambres.findIndex(c => c.id === r.chambreId);
+  if (ci !== -1 && chambres[ci].statut === 'OCCUPÉE') {
+    if (!confirm('⚠️ La chambre ' + r.chambre + ' est actuellement occupée. Confirmer le check-in ?')) return;
+  }
+  resas[idx].statut = 'CHECK-IN';
+  resas[idx].heureArrivee = new Date().toTimeString().substr(0,5);
+  DB.set('reservations', resas);
+  // Marquer chambre OCCUPÉE
+  if (ci !== -1) {
+    chambres[ci] = { ...chambres[ci], statut:'OCCUPÉE', client: r.nom+' '+r.prenom, checkin: r.checkin, checkout: r.checkout, nuits: r.nuits };
+    DB.set('chambres', chambres);
+  }
+  navigateTo('reservations');
+};
+
+window.showCheckoutFromResa = function(id) {
+  const r = (DB.get('reservations')||[]).find(x => x.id === id);
+  if (!r) return;
+  const allServices = DB.get('services') || [];
+  const resServices = allServices.filter(s => s.reservationId == id && s.paiement === 'facture');
+  const totalConsos = (r.consos||[]).reduce((s,c) => s+c.montant, 0) + resServices.reduce((s,sv) => s+(sv.montant||0), 0);
+  const ttc = (r.montant||0) + totalConsos;
+  const solde = ttc - (r.acompte||0);
+  showModal(`
+  <div class="modal-header"><h2>🚪 Check-out — ${r.nom} ${r.prenom}</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+  <div class="alert alert-warning" style="margin-bottom:12px;">
+    Chambre <strong>${r.chambre}</strong> | Séjour : ${r.checkin} → ${r.checkout} (${r.nuits} nuit(s))<br>
+    Hébergement : <strong>${fmtN(r.montant)} FCFA</strong>${totalConsos>0?' + Extras : '+fmtN(totalConsos)+' FCFA':''}<br>
+    Acompte versé : <strong>${fmtN(r.acompte||0)} FCFA</strong><br>
+    <strong>SOLDE À RÉGLER : ${fmtN(Math.max(0,solde))} FCFA</strong>
+  </div>
+  <div class="form-group"><label>Heure de sortie</label><input type="time" id="co2-heure" value="${new Date().toTimeString().substr(0,5)}" /></div>
+  <div class="form-group" style="margin-top:8px;"><label>Paiement du solde</label><select id="co2-paiement">${modePaiementOptions()}</select></div>
+  <div class="btn-row">
+    <button class="btn btn-warning" onclick="doCheckoutFromResa('${id}')">✅ Valider Check-out & Facture</button>
+    <button class="btn btn-outline" onclick="closeModal()">Annuler</button>
+  </div>`);
+};
+
+window.doCheckoutFromResa = function(id) {
+  const heureSortie = document.getElementById('co2-heure').value;
+  const paiement = document.getElementById('co2-paiement').value;
+  const resas = DB.get('reservations') || [];
+  const idx = resas.findIndex(r => r.id === id);
+  if (idx === -1) return;
+  const r = resas[idx];
+  
+  // Calcul solde net (déduire l'acompte déjà versé)
+  const allServices = DB.get('services') || [];
+  const resServices = allServices.filter(s => s.reservationId == id && s.paiement === 'facture');
+  const consoTotal = (r.consos||[]).reduce((s,c)=>s+(c.montant||0),0) + resServices.reduce((s,sv)=>s+(sv.montant||0),0);
+  const totalTTC = (r.montant||0) + consoTotal;
+  const acompteDejaVerse = r.acompte || 0;
+  const soldeARégler = Math.max(0, totalTTC - acompteDejaVerse);
+  
+  resas[idx].statut = 'CHECK-OUT';
+  resas[idx].heureSortie = heureSortie;
+  resas[idx].paiementFinal = paiement;
+  resas[idx].totalTTC = totalTTC;
+  resas[idx].soldeFinal = soldeARégler;
+  DB.set('reservations', resas);
+  
+  // Enregistrer le SOLDE en caisse (montant restant après déduction acompte)
+  if (soldeARégler > 0) {
+    const caisse = DB.get('caisse') || [];
+    caisse.push({
+      id: genId(), date: today(), type: 'CHECK-OUT',
+      ref: r.nom + ' ' + r.prenom + ' — Ch.' + r.chambre,
+      montant: soldeARégler, montantTTC: soldeARégler,
+      paiement, caissier: currentUser?.nom||'—',
+      recu: 'REC-' + genId().substr(-6).toUpperCase(),
+      reservationId: id,
+      note: acompteDejaVerse > 0 ? 'Solde après déduction acompte de ' + fmtN(acompteDejaVerse) + ' FCFA' : ''
+    });
+    DB.set('caisse', caisse);
+  }
+  
+  // Libérer chambre
+  const chambres = DB.get('chambres') || [];
+  const ci = chambres.findIndex(c => c.id === resas[idx].chambreId);
+  if (ci !== -1) {
+    chambres[ci] = { ...chambres[ci], statut:'DISPONIBLE', client:'', checkin:'', checkout:'', nuits:0 };
+    DB.set('chambres', chambres);
+  }
+  closeModal();
+  printFacture(id);
+  navigateTo('reservations');
+};
+
 function resaStatusBadge(s) {
   const map = { 'CONFIRMÉE':'blue','CHECK-IN':'green','CHECK-OUT':'gray','ANNULÉE':'red' };
   return `<span class="badge ${map[s]||'gray'}">${s||'—'}</span>`;
 }
 
 function showNewResaModal() {
-  const chambres = (DB.get('chambres')||[]).filter(c => c.statut === 'DISPONIBLE');
+  // Chambres disponibles = DISPONIBLE + OCCUPÉE mais uniquement si checkin dans le futur (pas en cours sans checkout)
+  const allChambres = DB.get('chambres') || [];
+  const resas = DB.get('reservations') || [];
+  const chambres = allChambres.filter(c => {
+    if (c.statut === 'DISPONIBLE') return true;
+    if (c.statut === 'OCCUPÉE') {
+      // Chambre occupée: vérifier si le client actuel a fait son checkout
+      const activeResa = resas.find(r => r.chambreId === c.id && r.statut === 'CHECK-IN');
+      if (activeResa) return false; // Client toujours en séjour
+    }
+    return false;
+  });
   showModal(`
   <div class="modal-header"><h2>📅 Nouvelle Réservation</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
   <div class="form-grid">
@@ -1422,7 +1676,7 @@ function showNewResaModal() {
     </div>
     <div class="form-group"><label>Chambre</label>
       <select id="nr-chambre">
-        ${chambres.map(c => `<option value="${c.id}">${c.num} — ${c.type} — ${fmtN(c.tarif)} F/nuit</option>`).join('')}
+        ${chambres.length ? chambres.map(c => `<option value="${c.id}">${c.num} — ${c.type} — ${fmtN(c.tarif)} F/nuit</option>`).join('') : '<option disabled>Aucune chambre disponible</option>'}
       </select>
     </div>
     <div class="form-group"><label>Adultes</label><input id="nr-adultes" type="number" value="1" min="1" /></div>
@@ -1462,7 +1716,20 @@ window.saveNewResa = function() {
   const checkout = document.getElementById('nr-checkout').value;
   if (!nom || !checkin || !checkout) { alert('Veuillez remplir tous les champs obligatoires.'); return; }
   const nuits = calcNights(checkin, checkout);
+  if (nuits <= 0) { alert('La date de départ doit être après la date d\'arrivée.'); return; }
+  
+  // Vérification de double-réservation pour la même chambre
   const resas = DB.get('reservations') || [];
+  const conflict = resas.find(r => 
+    r.chambreId === chamId && 
+    r.statut !== 'ANNULÉE' && r.statut !== 'CHECK-OUT' &&
+    !(checkout <= r.checkin || checkin >= r.checkout)
+  );
+  if (conflict) {
+    alert('⚠️ CONFLIT : La chambre ' + ch.num + ' est déjà réservée du ' + conflict.checkin + ' au ' + conflict.checkout + ' pour ' + conflict.nom + ' ' + conflict.prenom + '.\n\nChoisissez une autre chambre ou une autre période.');
+    return;
+  }
+  
   resas.push({
     id: genId(), date: today(), nom, prenom, tel: document.getElementById('nr-tel').value,
     canal: document.getElementById('nr-canal').value, chambre: ch.num, chambreId: chamId, type: ch.type,
@@ -2029,7 +2296,7 @@ function renderPointageTab() {
   <div class="card">
     <div class="card-title">⏱️ Pointage — ${new Date().toLocaleDateString('fr-FR', {weekday:'long',day:'numeric',month:'long'})}</div>
     ${isDir ? `<div style="margin-bottom:12px;"><button class="btn btn-sm btn-accent" onclick="showCorrectionPointageModal()">✏️ Corriger un pointage (Gérant)</button></div>` : ''}
-    ${personnel.filter(p => !p.isManager).map(p => {
+    ${personnel.map(p => {
       const ptg = todayPtg.find(x => x.personnelId === p.id);
       const entree = ptg?.entree || null;
       const sortie = ptg?.sortie || null;
@@ -3527,6 +3794,7 @@ function renderPointJournalier() {
   <div class="btn-row" style="margin-bottom:16px;">
     <button class="btn btn-primary" onclick="printPointJournalier()">🖨️ Imprimer Point Journalier</button>
     <button class="btn btn-outline" onclick="printPointMensuel()">🖨️ Imprimer Point Mensuel</button>
+    ${(currentUser?.role === 'constructeur' || currentUser?.role === 'directeur') ? `<button class="btn btn-warning" onclick="showEditPointJournalier()">✏️ Modifier / Corriger le Point</button>` : ''}
   </div>
 
   <div class="stats-grid">
@@ -3817,6 +4085,94 @@ window.printPointMensuel = function() {
   window.print();
 };
 
+
+// ============================================================
+// MODIFICATION POINT JOURNALIER (Directeur / Constructeur)
+// ============================================================
+window.showEditPointJournalier = function() {
+  const todayStr = today();
+  const caisse = DB.get('caisse') || [];
+  const depenses = DB.get('depenses') || [];
+  const todayCaisse = caisse.filter(e => e.date === todayStr);
+  const todayDep = depenses.filter(e => e.date === todayStr);
+  showModal(`
+  <div class="modal-header"><h2>✏️ Modifier le Point Journalier — ${todayStr}</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+  <div class="alert alert-warning">⚠️ Modification réservée au Directeur / Constructeur. Chaque opération peut être supprimée ou modifiée.</div>
+  
+  <div style="margin-bottom:16px;">
+    <strong>💰 Entrées de Caisse du jour (${todayCaisse.length})</strong>
+    <div class="table-wrap" style="max-height:200px;overflow-y:auto;"><table>
+      <thead><tr><th>Ref.</th><th>Type</th><th>Montant</th><th>Paiement</th><th>Action</th></tr></thead>
+      <tbody>
+        ${todayCaisse.map(e=>`<tr>
+          <td>${e.ref||e.recu||'—'}</td>
+          <td>${e.type||'—'}</td>
+          <td><input type="number" id="pj-c-${e.id}" value="${e.montantTTC||e.montant||0}" style="width:90px;padding:3px;" /></td>
+          <td>${e.paiement||'—'}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="supprimerCaisseEntry('${e.id}')">🗑️</button>
+              <button class="btn btn-sm btn-warning" onclick="saveCaisseEdit('${e.id}')">💾</button></td>
+        </tr>`).join('') || '<tr><td colspan="5" style="text-align:center;color:#888;">Aucune entrée</td></tr>'}
+      </tbody>
+    </table></div>
+  </div>
+  
+  <div>
+    <strong>📤 Dépenses du jour (${todayDep.length})</strong>
+    <div class="table-wrap" style="max-height:200px;overflow-y:auto;"><table>
+      <thead><tr><th>Libellé</th><th>Catégorie</th><th>Montant</th><th>Action</th></tr></thead>
+      <tbody>
+        ${todayDep.map(d=>`<tr>
+          <td>${d.libelle||'—'}</td>
+          <td>${d.categorie||'—'}</td>
+          <td><input type="number" id="pj-d-${d.id}" value="${d.montant||0}" style="width:90px;padding:3px;" /></td>
+          <td><button class="btn btn-sm btn-danger" onclick="supprimerDepenseEntry('${d.id}')">🗑️</button>
+              <button class="btn btn-sm btn-warning" onclick="saveDepenseEdit('${d.id}')">💾</button></td>
+        </tr>`).join('') || '<tr><td colspan="4" style="text-align:center;color:#888;">Aucune dépense</td></tr>'}
+      </tbody>
+    </table></div>
+  </div>
+  
+  <div class="btn-row" style="margin-top:16px;">
+    <button class="btn btn-outline" onclick="closeModal(); navigateTo('point_journalier');">Fermer & Actualiser</button>
+  </div>`);
+};
+
+window.supprimerCaisseEntry = function(id) {
+  if (!confirm('Supprimer cette entrée de caisse ?')) return;
+  const caisse = (DB.get('caisse')||[]).filter(e => e.id !== id);
+  DB.set('caisse', caisse);
+  showEditPointJournalier();
+};
+
+window.saveCaisseEdit = function(id) {
+  const caisse = DB.get('caisse') || [];
+  const idx = caisse.findIndex(e => e.id === id);
+  if (idx === -1) return;
+  const newVal = parseFloat(document.getElementById('pj-c-'+id)?.value);
+  if (isNaN(newVal) || newVal < 0) { alert('Montant invalide'); return; }
+  caisse[idx].montantTTC = newVal;
+  caisse[idx].montant = newVal;
+  DB.set('caisse', caisse);
+  alert('✅ Montant mis à jour');
+};
+
+window.supprimerDepenseEntry = function(id) {
+  if (!confirm('Supprimer cette dépense ?')) return;
+  const dep = (DB.get('depenses')||[]).filter(e => e.id !== id);
+  DB.set('depenses', dep);
+  showEditPointJournalier();
+};
+
+window.saveDepenseEdit = function(id) {
+  const dep = DB.get('depenses') || [];
+  const idx = dep.findIndex(e => e.id === id);
+  if (idx === -1) return;
+  const newVal = parseFloat(document.getElementById('pj-d-'+id)?.value);
+  if (isNaN(newVal) || newVal < 0) { alert('Montant invalide'); return; }
+  dep[idx].montant = newVal;
+  DB.set('depenses', dep);
+  alert('✅ Montant mis à jour');
+};
 
 function bindPageEvents(page) {
   // Auto-attach enter key on login
